@@ -1,14 +1,24 @@
 #include "size_rollup.h"
 #include "../include/smon_api.h"
+#include "../asm/simd_sum.h"
+#include <intrin.h>
+
+static bool DetectAVX2()
+{
+    int info[4] = {};
+    __cpuid(info, 7);
+    return (info[1] & (1 << 5)) != 0; // EBX bit 5 = AVX2
+}
+
+static const bool s_have_avx2 = DetectAVX2();
 
 void RollupSizes(ScanResult* result)
 {
     if (!result || !result->nodes || result->node_count == 0)
         return;
 
-    uint64_t total_bytes = 0;
-    uint64_t file_count  = 0;
-    uint64_t dir_count   = 0;
+    uint64_t file_count = 0;
+    uint64_t dir_count  = 0;
 
     // Tally counts in forward order before rolling up sizes.
     for (uint32_t i = 0; i < result->node_count; ++i) {
@@ -25,8 +35,37 @@ void RollupSizes(ScanResult* result)
         ScanNode* n = &result->nodes[i];
         if (n->parent != UINT32_MAX)
             result->nodes[n->parent].size += n->size;
-        else
-            total_bytes += n->size; // root contributes to total
+    }
+
+    // After propagation, sum sizes of root-level nodes to get total_bytes.
+    // In nearly all scans there is exactly one root, but handle the general case.
+    // Use SIMD when available; a small scratch array avoids a second indirection loop.
+    uint64_t total_bytes = 0;
+    {
+        // Count roots first so we can decide whether SIMD is worth it.
+        uint32_t root_count = 0;
+        for (uint32_t i = 0; i < result->node_count; ++i) {
+            if (result->nodes[i].parent == UINT32_MAX)
+                ++root_count;
+        }
+
+        if (s_have_avx2 && root_count > 1) {
+            // Gather root sizes into a contiguous array for the SIMD sum.
+            uint64_t* scratch = new uint64_t[root_count];
+            uint32_t  idx     = 0;
+            for (uint32_t i = 0; i < result->node_count; ++i) {
+                if (result->nodes[i].parent == UINT32_MAX)
+                    scratch[idx++] = result->nodes[i].size;
+            }
+            total_bytes = SmonSumU64_AVX2(scratch, root_count);
+            delete[] scratch;
+        } else {
+            // Scalar path: single root (common case) or no AVX2.
+            for (uint32_t i = 0; i < result->node_count; ++i) {
+                if (result->nodes[i].parent == UINT32_MAX)
+                    total_bytes += result->nodes[i].size;
+            }
+        }
     }
 
     result->total_bytes = total_bytes;
