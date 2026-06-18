@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RootNamespace>SizeMonitor</RootNamespace>
+    <AssemblyName>SizeMonitor</AssemblyName>
+    <Version>1.0.0</Version>
+    <Authors>Nathan Curtis</Authors>
+    <Product>Size Monitor</Product>
+    <AssemblyTitle>Size Monitor</AssemblyTitle>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Interop\SizeMonitor.Interop.csproj" />
+  </ItemGroup>
+</Project>

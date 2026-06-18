@@ -1,0 +1,14 @@
+bin/
+obj/
+build/
+dist/
+*.user
+*.suo
+.vs/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Core/build/
+*.sdf
+*.opensdf
+ipch/
