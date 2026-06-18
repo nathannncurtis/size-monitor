@@ -12,4 +12,5 @@ struct ScanContext {
     HANDLE             thread      = nullptr;
     std::atomic<bool>  cancelled   = false;
     DWORD              error       = 0;    // GetLastError() on failure, 0 = success
+    bool               rolled_up   = false; // guard: RollupSizes must run exactly once
 };

@@ -26,6 +26,9 @@ NodePool::~NodePool()
 
 uint32_t NodePool::AllocNode()
 {
+    if (!m_base)
+        return UINT32_MAX; // reservation failed at construction
+
     SIZE_T needed = (static_cast<SIZE_T>(m_node_count) + 1) * sizeof(ScanNode);
     if (needed > m_node_committed)
         GrowNodes();
@@ -38,6 +41,9 @@ uint32_t NodePool::AllocNode()
 
 uint32_t NodePool::AppendName(const wchar_t* name, uint32_t len)
 {
+    if (!m_base)
+        return 0; // reservation failed at construction
+
     uint32_t byte_len = len * static_cast<uint32_t>(sizeof(wchar_t));
     uint32_t offset   = m_name_used;
 
@@ -64,6 +70,9 @@ void NodePool::Finalize(ScanResult* out)
 
 bool NodePool::Full() const
 {
+    // Also full if reservation failed at construction.
+    if (!m_base)
+        return true;
     // Safety cap: refuse before we hit UINT32_MAX index space.
     return m_node_count >= (UINT32_MAX / 2);
 }

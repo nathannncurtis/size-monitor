@@ -256,58 +256,69 @@ static void NTAPI WorkCallback(PTP_CALLBACK_INSTANCE, PVOID ctx_ptr, PTP_WORK)
             bool is_dotdot = (name_chars == 2 && fdi->FileName[0] == L'.' && fdi->FileName[1] == L'.');
 
             if (!is_dot && !is_dotdot) {
-                if (!ctx->pool.Full()) {
-                    uint32_t idx = ctx->pool.AllocNode();
-                    ScanNode* node = ctx->pool.NodeAt(idx);
-                    node->name_offset  = ctx->pool.AppendName(fdi->FileName, name_chars);
-                    node->name_len     = name_chars;
-                    node->flags        = 0;
-                    node->parent       = item.parent_idx;
-                    node->first_child  = UINT32_MAX;
-                    node->next_sibling = UINT32_MAX;
+                bool is_dir    = (fdi->FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+                bool is_reparse = (fdi->FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+                uint64_t entry_size = is_dir ? 0 :
+                    static_cast<uint64_t>(fdi->AllocationSize.QuadPart);
 
-                    bool is_dir = (fdi->FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-                    if (is_dir)
-                        node->flags |= SMON_FLAG_DIRECTORY;
-                    if (fdi->FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
-                        node->flags |= SMON_FLAG_REPARSE;
+                // Build subdirectory path before taking the lock (avoids holding CS
+                // across std::wstring allocation).
+                std::wstring child_path;
+                bool enqueue_child = false;
+                if (is_dir && !is_reparse) {
+                    child_path = item.path;
+                    if (child_path.back() != L'\\')
+                        child_path += L'\\';
+                    child_path.append(fdi->FileName, name_chars);
+                    enqueue_child = true;
+                }
 
-                    if (is_dir) {
-                        node->size = 0;
-                        // Build child path and enqueue.
-                        if (!(fdi->FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
-                            std::wstring child_path = item.path;
-                            if (child_path.back() != L'\\')
-                                child_path += L'\\';
-                            child_path.append(fdi->FileName, name_chars);
+                // AllocNode, AppendName, node field writes, and sibling-chain link
+                // must all be serialized: NodePool is not thread-safe and multiple
+                // workers can share the same parent_idx, causing lost-update on
+                // parent->first_child without the lock.
+                uint32_t idx = UINT32_MAX;
+                {
+                    EnterCriticalSection(&state->cs);
+                    if (!ctx->pool.Full()) {
+                        idx = ctx->pool.AllocNode();
+                        ScanNode* node = ctx->pool.NodeAt(idx);
+                        node->name_offset  = ctx->pool.AppendName(fdi->FileName, name_chars);
+                        node->name_len     = name_chars;
+                        node->flags        = 0;
+                        if (is_dir)    node->flags |= SMON_FLAG_DIRECTORY;
+                        if (is_reparse) node->flags |= SMON_FLAG_REPARSE;
+                        node->size         = entry_size;
+                        node->parent       = item.parent_idx;
+                        node->first_child  = UINT32_MAX;
 
+                        // Prepend to parent's child list atomically under the lock.
+                        ScanNode* parent_node  = ctx->pool.NodeAt(item.parent_idx);
+                        node->next_sibling     = parent_node->first_child;
+                        parent_node->first_child = idx;
+
+                        if (enqueue_child) {
                             DirWorkItem child_item;
                             child_item.path       = std::move(child_path);
                             child_item.parent_idx = idx;
-
-                            EnterCriticalSection(&state->cs);
                             state->pending.push(std::move(child_item));
-                            LeaveCriticalSection(&state->cs);
+                        }
+                    }
+                    LeaveCriticalSection(&state->cs);
+                }
 
+                if (idx != UINT32_MAX) {
+                    if (is_dir) {
+                        InterlockedIncrement64(
+                            reinterpret_cast<volatile LONG64*>(&state->dirs_done));
+                        if (enqueue_child) {
                             InterlockedIncrement(&state->in_flight);
                             SubmitThreadpoolWork(state->tp_work);
                         }
-                        InterlockedIncrement64(
-                            reinterpret_cast<volatile LONG64*>(&state->dirs_done));
                     } else {
-                        node->size = static_cast<uint64_t>(fdi->AllocationSize.QuadPart);
                         InterlockedIncrement64(
                             reinterpret_cast<volatile LONG64*>(&state->files_done));
                     }
-
-                    // Link into parent's child list (protected by pool's caller sync contract).
-                    // Use interlocked swap on first_child to prepend atomically.
-                    // NodePool is not thread-safe for AllocNode/AppendName, so we serialize
-                    // pool access via the critical section.
-                    ScanNode* parent_node = ctx->pool.NodeAt(item.parent_idx);
-                    // Single atomic link -- no extra lock needed; each thread owns its parent slot.
-                    node->next_sibling       = parent_node->first_child;
-                    parent_node->first_child = idx;
 
                     // Progress callback every 1000 directories.
                     uint64_t dd = state->dirs_done;

@@ -1,7 +1,9 @@
 #include "mft_scanner.h"
 #include "scan_context.h"
 #include <unordered_map>
+#include <vector>
 #include <cstring>
+#include <winioctl.h>   // FILE_ID_DESCRIPTOR, OpenFileById
 
 // IOCTL codes for USN journal access (stable numeric values).
 #ifndef FSCTL_QUERY_USN_JOURNAL
@@ -105,6 +107,10 @@ DWORD WINAPI MftScanThread(LPVOID param)
     std::unordered_map<DWORDLONG, uint32_t> frn_map;
     frn_map.reserve(1 << 18); // pre-size for ~260k entries
 
+    // Parallel array: frn_by_idx[pool_index] = FileReferenceNumber.
+    // Used in the third pass to open file nodes by ID and query allocation size.
+    std::vector<DWORDLONG> frn_by_idx;
+
     MFT_ENUM_DATA_V0_LOCAL med{};
     med.StartFileReferenceNumber = 0;
     med.LowUsn  = 0;
@@ -184,6 +190,11 @@ DWORD WINAPI MftScanThread(LPVOID param)
 
             frn_map[rec->FileReferenceNumber] = idx;
 
+            // Track FRN per pool index for the size-query pass (third pass).
+            if (idx >= static_cast<uint32_t>(frn_by_idx.size()))
+                frn_by_idx.resize(idx + 1, 0ULL);
+            frn_by_idx[idx] = rec->FileReferenceNumber;
+
             // Store ParentFRN temporarily in the size field (64-bit, safe).
             // We'll fix it in the second pass.
             memcpy(&node->size, &rec->ParentFileReferenceNumber, sizeof(DWORDLONG));
@@ -224,6 +235,56 @@ DWORD WINAPI MftScanThread(LPVOID param)
         ScanNode* parent_node = ctx->pool.NodeAt(parent_idx);
         node->next_sibling        = parent_node->first_child;
         parent_node->first_child  = i;
+    }
+
+    // Third pass: query on-disk allocation size for each file (non-directory) node.
+    // USN_RECORD_V2 has no size field, so we must open each file by ID.
+    // Re-open the volume as a root handle for OpenFileById.
+    if (!ctx->cancelled.load()) {
+        // OpenFileById needs a handle to any file on the volume; the volume root works.
+        wchar_t root_path[8] = {};
+        root_path[0] = vol_path[4]; // drive letter
+        root_path[1] = L':';
+        root_path[2] = L'\\';
+        root_path[3] = L'\0';
+
+        HANDLE root_dir = CreateFileW(root_path,
+                                      0,
+                                      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                      nullptr,
+                                      OPEN_EXISTING,
+                                      FILE_FLAG_BACKUP_SEMANTICS,
+                                      nullptr);
+        if (root_dir != INVALID_HANDLE_VALUE) {
+            for (uint32_t i = 0; i < node_count; ++i) {
+                if (ctx->cancelled.load())
+                    break;
+                ScanNode* node = ctx->pool.NodeAt(i);
+                if (node->flags & SMON_FLAG_DIRECTORY)
+                    continue; // dirs: size will be rolled up from children
+                if (i >= static_cast<uint32_t>(frn_by_idx.size()))
+                    continue;
+
+                FILE_ID_DESCRIPTOR fid{};
+                fid.dwSize  = sizeof(FILE_ID_DESCRIPTOR);
+                fid.Type    = FileIdType; // 0 = 64-bit file ID
+                fid.FileId.QuadPart = static_cast<LONGLONG>(frn_by_idx[i]);
+
+                HANDLE fh = OpenFileById(root_dir, &fid,
+                                         FILE_READ_ATTRIBUTES,
+                                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                         nullptr,
+                                         FILE_FLAG_BACKUP_SEMANTICS);
+                if (fh == INVALID_HANDLE_VALUE)
+                    continue; // access denied / deleted since enumeration; leave size 0
+
+                FILE_STANDARD_INFO fsi{};
+                if (GetFileInformationByHandleEx(fh, FileStandardInfo, &fsi, sizeof(fsi)))
+                    node->size = static_cast<uint64_t>(fsi.AllocationSize.QuadPart);
+                CloseHandle(fh);
+            }
+            CloseHandle(root_dir);
+        }
     }
 
     QueryPerformanceCounter(&t1);

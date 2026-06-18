@@ -37,7 +37,10 @@ BOOL WINAPI Smon_GetResult(ScanHandle h, ScanResult* out)
     if (!h || !out) return FALSE;
     auto* ctx = static_cast<ScanContext*>(h);
     ctx->pool.Finalize(&ctx->result);
-    RollupSizes(&ctx->result);
+    if (!ctx->rolled_up) {
+        RollupSizes(&ctx->result);
+        ctx->rolled_up = true;
+    }
     *out = ctx->result;
     return ctx->error == 0;
 }
