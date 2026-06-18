@@ -1,8 +1,8 @@
-using System.Windows;
+using Wpf.Ui.Controls;
 
 namespace SizeMonitor;
 
-public partial class MainWindow : Window
+public partial class MainWindow : FluentWindow
 {
     public MainWindow()
     {
