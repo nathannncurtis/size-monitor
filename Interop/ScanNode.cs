@@ -2,7 +2,8 @@ using System.Runtime.InteropServices;
 
 namespace SizeMonitor.Interop;
 
-[StructLayout(LayoutKind.Sequential)]
+// 32 bytes, Pack=8 matches the C struct comment in smon_api.h
+[StructLayout(LayoutKind.Sequential, Pack = 8)]
 public struct ScanNode
 {
     public ulong Size;
@@ -10,13 +11,78 @@ public struct ScanNode
     public uint  FirstChild;
     public uint  NextSibling;
     public uint  Flags;
-    public uint  NameOffset;
-    public uint  NameLen;
+    public uint  NameOffset; // byte offset into name_buf
+    public uint  NameLen;    // wchar_t count, not bytes
 }
 
 public static class ScanNodeFlags
 {
-    public const uint Directory = 0x01;
-    public const uint Symlink   = 0x02;
-    public const uint Reparse   = 0x04;
+    public const uint Directory = 0x01u;
+    public const uint Symlink   = 0x02u;
+    public const uint Reparse   = 0x04u;
+}
+
+// Mirrors the C ScanResult struct for P/Invoke; must not be copied after Smon_GetResult.
+[StructLayout(LayoutKind.Sequential)]
+internal unsafe struct ScanResultNative
+{
+    public ScanNode* Nodes;
+    public uint      NodeCount;
+    // 4 bytes implicit padding here on x64 to align the pointer below
+    private uint     _pad;
+    public char*     NameBuf;
+    public ulong     TotalBytes;
+    public ulong     FileCount;
+    public ulong     DirCount;
+    public double    ElapsedSec;
+}
+
+public record ScanProgress(ulong DirsVisited, ulong FilesVisited, ulong BytesSeen);
+
+public sealed class ScanResultManaged
+{
+    public required ScanNode[] Nodes      { get; init; }
+    public required string[]   Names      { get; init; }
+    public ulong               TotalBytes { get; init; }
+    public ulong               FileCount  { get; init; }
+    public ulong               DirCount   { get; init; }
+    public double              ElapsedSec { get; init; }
+
+    public string GetName(uint nodeIndex) => Names[nodeIndex];
+
+    internal static unsafe ScanResultManaged FromNative(ScanResultNative native)
+    {
+        var nodes = new ScanNode[native.NodeCount];
+        if (native.NodeCount > 0 && native.Nodes != null)
+        {
+            var span = new ReadOnlySpan<ScanNode>(native.Nodes, (int)native.NodeCount);
+            span.CopyTo(nodes);
+        }
+
+        var names = new string[native.NodeCount];
+        for (int i = 0; i < (int)native.NodeCount; i++)
+        {
+            ref readonly ScanNode n = ref nodes[i];
+            if (native.NameBuf != null && n.NameLen > 0)
+            {
+                // name_offset is a byte offset into a wchar_t buffer; divide by 2 for char index
+                char* ptr = (char*)native.NameBuf + (n.NameOffset / sizeof(char));
+                names[i] = new string(ptr, 0, (int)n.NameLen);
+            }
+            else
+            {
+                names[i] = string.Empty;
+            }
+        }
+
+        return new ScanResultManaged
+        {
+            Nodes      = nodes,
+            Names      = names,
+            TotalBytes = native.TotalBytes,
+            FileCount  = native.FileCount,
+            DirCount   = native.DirCount,
+            ElapsedSec = native.ElapsedSec,
+        };
+    }
 }
